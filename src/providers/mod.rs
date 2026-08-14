@@ -62,7 +62,7 @@ pub trait Provider: Send + Sync {
     /// Short slug used in session metadata (e.g. `"claude-code"`).
     fn slug(&self) -> &str;
 
-    /// CLI alias used in `casr <alias> resume …` (e.g. `"cc"`).
+    /// CLI alias used in `casr resume <alias> …` (e.g. `"cc"`).
     fn cli_alias(&self) -> &str;
 
     /// Probe whether this provider is installed on the machine.
