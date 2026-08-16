@@ -6,6 +6,20 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ---
 
+## [v0.3.1] -- 2026-08-15
+
+Patch release. Tag + GitHub Release (linux x86_64 musl binary).
+
+### Fixed
+
+- **Documented `resume` argument order corrected**: every documented target-first form (`casr <target> resume <id>`) was rejected by clap; the CLI has always been `casr resume <TARGET> <SESSION_ID>`. README, AGENTS.md, `install.sh`, in-source doc comments, and the Antigravity error-message hint now show the real form ([`f66f27f`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/f66f27f0b1f4b9fe9396c026627b3814455d2e6c)).
+
+### Build
+
+- Parallel rustc front-end enabled (`-Z threads=4`) and local `target-rel/` ignored.
+
+---
+
 ## [Unreleased] (after v0.1.1)
 
 > Commits on `main` since the v0.1.1 tag (`be1ce19`, 2026-03-03). No GitHub Release yet.
