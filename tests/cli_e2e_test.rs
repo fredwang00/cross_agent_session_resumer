@@ -387,6 +387,118 @@ fn cli_list_limit_applies_per_provider() {
     }
 }
 
+/// Collect `session_id` values from a `list --json` invocation.
+fn list_session_ids(output: &std::process::Output) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("list --json should emit valid JSON");
+    parsed["items"]
+        .as_array()
+        .expect("list --json items should be an array")
+        .iter()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn cli_list_all_includes_sessions_from_every_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let myapp_id = setup_cc_fixture(&tmp, "cc_simple"); // /data/projects/myapp
+    let webapp_id = setup_cc_fixture(&tmp, "cc_complex"); // /data/projects/webapp
+
+    // Default scope is the cwd, which matches neither fixture workspace.
+    let scoped = casr_cmd(&tmp)
+        .args(["--json", "list"])
+        .output()
+        .expect("list should run");
+    assert!(scoped.status.success());
+    let scoped_ids = list_session_ids(&scoped);
+    assert!(
+        !scoped_ids.contains(&myapp_id) && !scoped_ids.contains(&webapp_id),
+        "cwd-scoped list must not surface other workspaces, got {scoped_ids:?}"
+    );
+
+    // `--all` drops the workspace filter entirely.
+    let all = casr_cmd(&tmp)
+        .args(["--json", "list", "--all"])
+        .output()
+        .expect("list --all should run");
+    assert!(all.status.success());
+    let all_ids = list_session_ids(&all);
+    assert!(
+        all_ids.contains(&myapp_id),
+        "expected myapp session with --all, got {all_ids:?}"
+    );
+    assert!(
+        all_ids.contains(&webapp_id),
+        "expected webapp session with --all, got {all_ids:?}"
+    );
+}
+
+#[test]
+fn cli_list_all_conflicts_with_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let output = casr_cmd(&tmp)
+        .args(["list", "--all", "--workspace", "/data/projects/myapp"])
+        .output()
+        .expect("list should run");
+
+    assert!(
+        !output.status.success(),
+        "--all combined with --workspace must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_list_limit_zero_means_unlimited() {
+    let tmp = TempDir::new().unwrap();
+    // 12 sessions in one workspace: more than the default limit of 10.
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        ids.push(setup_cc_fixture_custom(
+            &tmp,
+            "cc_simple",
+            Some("/data/projects/myapp"),
+            Some(&format!("limit-zero-{i:02}")),
+        ));
+    }
+
+    let capped = casr_cmd(&tmp)
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
+        .output()
+        .expect("list should run");
+    assert!(capped.status.success());
+    assert_eq!(
+        list_session_ids(&capped).len(),
+        10,
+        "default limit should cap at 10"
+    );
+
+    let unlimited = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/data/projects/myapp",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .expect("list --limit 0 should run");
+    assert!(unlimited.status.success());
+    let unlimited_ids = list_session_ids(&unlimited);
+    assert_eq!(
+        unlimited_ids.len(),
+        ids.len(),
+        "--limit 0 should return every session, got {unlimited_ids:?}"
+    );
+}
+
 #[test]
 fn cli_list_workspace_filter_filters_sessions() {
     let tmp = TempDir::new().unwrap();

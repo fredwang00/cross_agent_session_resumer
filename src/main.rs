@@ -114,7 +114,13 @@ enum Command {
         #[arg(long)]
         workspace: Option<String>,
 
-        /// Maximum sessions to show per provider.
+        /// List sessions from every workspace instead of only the current
+        /// project. Without this, `list` scopes to the working directory, which
+        /// hides sessions recorded in other repos.
+        #[arg(long, conflicts_with = "workspace")]
+        all: bool,
+
+        /// Maximum sessions to show per provider. Use 0 for no limit.
         #[arg(long, default_value = "10")]
         limit: usize,
 
@@ -294,12 +300,14 @@ fn main() -> ExitCode {
         Command::List {
             provider,
             workspace,
+            all,
             limit,
             sort,
             enrich_fs,
         } => cmd_list(
             provider.as_deref(),
             workspace.as_deref(),
+            all,
             limit,
             &sort,
             cli.json,
@@ -454,9 +462,34 @@ fn cmd_resume(
     Ok(())
 }
 
+/// Every path spelling a workspace can legitimately take.
+///
+/// macOS resolves `/var`, `/tmp`, and `/etc` through symlinks into `/private`,
+/// so `std::env::current_dir()` reports `/private/var/...` while providers
+/// record whichever spelling the shell used (`/var/...`). Comparing a single
+/// spelling makes sessions under those directories invisible to `list`.
+fn workspace_match_candidates(ws: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![ws.to_path_buf()];
+    if let Ok(canonical) = ws.canonicalize()
+        && !candidates.contains(&canonical)
+    {
+        candidates.push(canonical);
+    }
+    // The reverse direction: canonicalization only ever *adds* the `/private`
+    // prefix, so strip it to recover the spelling a provider likely recorded.
+    if let Ok(stripped) = ws.strip_prefix("/private") {
+        let rooted = Path::new("/").join(stripped);
+        if !candidates.contains(&rooted) {
+            candidates.push(rooted);
+        }
+    }
+    candidates
+}
+
 fn cmd_list(
     provider_filter: Option<&str>,
     workspace_filter: Option<&str>,
+    all_workspaces: bool,
     limit: usize,
     sort: &str,
     json_mode: bool,
@@ -949,6 +982,10 @@ fn cmd_list(
     }
 
     fn probe_limit_for_sort(limit: usize, sort: &str, workspace_scoped: bool) -> usize {
+        // limit == 0 means "no limit", so every candidate must be scanned.
+        if limit == 0 {
+            return usize::MAX;
+        }
         if sort == "date" {
             // Cap expensive provider scans while preserving high confidence for
             // "most recent" results. Workspace-scoped lists can use a tighter cap.
@@ -968,23 +1005,36 @@ fn cmd_list(
             return true;
         };
 
+        // A workspace can be spelled more than one way (see
+        // `workspace_match_candidates`); any spelling is a legitimate match.
+        let candidates = workspace_match_candidates(ws.as_path());
+
         match provider_slug {
             "claude-code" => {
-                let expected = casr::providers::claude_code::project_dir_key(ws.as_path());
-                path.parent()
+                let observed = path
+                    .parent()
                     .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    == Some(expected.as_str())
+                    .and_then(|n| n.to_str());
+                observed.is_some_and(|dir_name| {
+                    candidates.iter().any(|candidate| {
+                        casr::providers::claude_code::project_dir_key(candidate) == dir_name
+                    })
+                })
             }
             "gemini" => {
-                let expected_hash = casr::providers::gemini::project_hash(ws.as_path());
                 let observed_hash = path
                     .parent()
                     .and_then(|p| p.parent())
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str());
                 match observed_hash {
-                    Some(hash) if hash == expected_hash => true,
+                    Some(hash)
+                        if candidates.iter().any(|candidate| {
+                            casr::providers::gemini::project_hash(candidate) == hash
+                        }) =>
+                    {
+                        true
+                    }
                     Some(hash)
                         if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
                     {
@@ -1007,34 +1057,36 @@ fn cmd_list(
         workspace_filter: Option<&PathBuf>,
     ) -> Option<Vec<(String, PathBuf)>> {
         let ws = workspace_filter?;
+        // Each spelling of the workspace maps to its own project directory, so
+        // all of them have to be collected rather than just the first.
+        let candidates = workspace_match_candidates(ws.as_path());
         match provider_slug {
             "claude-code" => {
                 let claude_home = std::env::var("CLAUDE_HOME")
                     .ok()
                     .map(PathBuf::from)
                     .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
-                let expected_dir = claude_home
-                    .join("projects")
-                    .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
-                if !expected_dir.is_dir() {
-                    return Some(vec![]);
-                }
+                let projects_dir = claude_home.join("projects");
 
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-                let entries = match std::fs::read_dir(&expected_dir) {
-                    Ok(entries) => entries,
-                    Err(_) => return Some(vec![]),
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
-                    {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                for candidate in &candidates {
+                    let expected_dir = projects_dir
+                        .join(casr::providers::claude_code::project_dir_key(candidate));
+                    let Ok(entries) = std::fs::read_dir(&expected_dir) else {
                         continue;
                     };
-                    sessions.push((stem.to_string(), path));
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file()
+                            || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                        {
+                            continue;
+                        }
+                        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        sessions.push((stem.to_string(), path));
+                    }
                 }
                 Some(sessions)
             }
@@ -1044,9 +1096,16 @@ fn cmd_list(
                     .map(PathBuf::from)
                     .or_else(|| dirs::home_dir().map(|h| h.join(".gemini")))?;
                 let tmp_root = gemini_home.join("tmp");
-                let hash = casr::providers::gemini::project_hash(ws.as_path());
-                let chats_dir = tmp_root.join(hash).join("chats");
-                if !chats_dir.is_dir() {
+                let chats_dirs: Vec<PathBuf> = candidates
+                    .iter()
+                    .map(|candidate| {
+                        tmp_root
+                            .join(casr::providers::gemini::project_hash(candidate))
+                            .join("chats")
+                    })
+                    .filter(|dir| dir.is_dir())
+                    .collect();
+                if chats_dirs.is_empty() {
                     // Fallback to generic provider enumeration when tmp/ has
                     // legacy/non-hash chat roots (fixtures or older layouts).
                     // Otherwise, return empty early to avoid an expensive scan.
@@ -1071,27 +1130,28 @@ fn cmd_list(
                 }
 
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-                let entries = match std::fs::read_dir(&chats_dir) {
-                    Ok(entries) => entries,
-                    Err(_) => return Some(vec![]),
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                for chats_dir in &chats_dirs {
+                    let Ok(entries) = std::fs::read_dir(chats_dir) else {
                         continue;
                     };
-                    if !(name.starts_with("session-") && name.ends_with(".json")) {
-                        continue;
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if !(name.starts_with("session-") && name.ends_with(".json")) {
+                            continue;
+                        }
+                        let session_id = name
+                            .strip_prefix("session-")
+                            .and_then(|n| n.strip_suffix(".json"))
+                            .unwrap_or(name)
+                            .to_string();
+                        sessions.push((session_id, path));
                     }
-                    let session_id = name
-                        .strip_prefix("session-")
-                        .and_then(|n| n.strip_suffix(".json"))
-                        .unwrap_or(name)
-                        .to_string();
-                    sessions.push((session_id, path));
                 }
                 Some(sessions)
             }
@@ -1100,14 +1160,22 @@ fn cmd_list(
     }
 
     let workspace_filter_explicit = workspace_filter.is_some();
-    let workspace_filter = workspace_filter
-        .map(expand_tilde_path)
-        .or_else(|| std::env::current_dir().ok());
+    // `--all` is the only way to get an unscoped listing: without it the filter
+    // falls back to the cwd, so sessions recorded in other repos stay hidden.
+    let workspace_filter = if all_workspaces {
+        None
+    } else {
+        workspace_filter
+            .map(expand_tilde_path)
+            .or_else(|| std::env::current_dir().ok())
+    };
     let workspace_scope = workspace_filter
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "all workspaces".to_string());
-    let workspace_scope_label = if workspace_filter_explicit {
+    let workspace_scope_label = if all_workspaces {
+        "every workspace (--all)"
+    } else if workspace_filter_explicit {
         "workspace project (--workspace)"
     } else {
         "current working-directory project"
@@ -1238,8 +1306,14 @@ fn cmd_list(
     }
 
     if let Some(filter) = workspace_filter.as_ref() {
+        let filter_candidates = workspace_match_candidates(filter);
         sessions.retain(|s| {
-            s.workspace.as_ref().is_some_and(|w| w.starts_with(filter))
+            let workspace_matches = s.workspace.as_ref().is_some_and(|w| {
+                workspace_match_candidates(w)
+                    .iter()
+                    .any(|w| filter_candidates.iter().any(|f| w.starts_with(f)))
+            });
+            workspace_matches
                 || (provider_has_workspace_path_hint(&s.provider)
                     && workspace_hint_matches(&s.provider, &s.path, Some(filter)))
         });
@@ -1269,7 +1343,9 @@ fn cmd_list(
                 ));
             }
         }
-        provider_sessions.truncate(limit);
+        if limit > 0 {
+            provider_sessions.truncate(limit);
+        }
     }
 
     let non_empty_group_count = sessions_by_provider
@@ -1306,13 +1382,26 @@ fn cmd_list(
         }
 
         let console = Console::new();
-        console.print(&format!(
-            "[bold cyan]Project-scoped sessions[/] for [bold]{workspace_scope}[/]"
-        ));
+        if all_workspaces {
+            console.print("[bold cyan]All sessions[/] across [bold]every workspace[/]");
+        } else {
+            console.print(&format!(
+                "[bold cyan]Project-scoped sessions[/] for [bold]{workspace_scope}[/]"
+            ));
+        }
         console.print(&format!("[dim]Scope:[/] [bold]{workspace_scope_label}[/]"));
-        console.print(&format!(
-            "[dim]Showing up to[/] [bold]{limit}[/] [dim]most recent sessions per provider[/]"
-        ));
+        if limit > 0 {
+            console.print(&format!(
+                "[dim]Showing up to[/] [bold]{limit}[/] [dim]most recent sessions per provider[/]"
+            ));
+        } else {
+            console.print("[dim]Showing[/] [bold]all[/] [dim]sessions per provider[/]");
+        }
+        if !all_workspaces {
+            console.print(
+                "[dim]Tip:[/] pass [bold]--all[/] [dim]to include sessions from other workspaces[/]",
+            );
+        }
 
         let now_millis = Utc::now().timestamp_millis();
 
@@ -1328,17 +1417,30 @@ fn cmd_list(
                 provider_sessions.len()
             ));
 
+            let scope_suffix = if all_workspaces {
+                "Across All Workspaces"
+            } else {
+                "in This Project"
+            };
             let mut table = Table::new()
                 .title(format!(
-                    "Top {} Most Recently Active {} Sessions in This Project",
+                    "Top {} Most Recently Active {} Sessions {}",
                     provider_sessions.len(),
-                    provider
+                    provider,
+                    scope_suffix
                 ))
                 .header_style(Style::parse("bold black on bright_white").unwrap_or_default())
                 .border_style(Style::parse("cyan").unwrap_or_default())
                 .with_column(Column::new("#").justify(JustifyMethod::Right).width(3))
                 .with_column(Column::new("Session ID").min_width(36))
-                .with_column(Column::new("Name").justify(JustifyMethod::Left).width(24))
+                .with_column(Column::new("Name").justify(JustifyMethod::Left).width(24));
+            // Without the workspace, rows from different repos are
+            // indistinguishable in an unscoped listing.
+            if all_workspaces {
+                table = table
+                    .with_column(Column::new("Workspace").justify(JustifyMethod::Left).width(20));
+            }
+            table = table
                 .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
                 .with_column(
                     Column::new("Size KB")
@@ -1388,10 +1490,22 @@ fn cmd_list(
                 let started = s.started_at_display();
                 let last_active = s.last_active_display(now_millis);
                 let last_active_cell_style = last_active_style(s.last_active_at, now_millis);
-                table.add_row(Row::new(vec![
+                let workspace_label = s
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|n| truncate_display_name(n, 18))
+                    .unwrap_or_default();
+                let mut cells = vec![
                     Cell::new(rank.as_str()),
                     Cell::new(session_id),
                     Cell::new(native_name.as_str()),
+                ];
+                if all_workspaces {
+                    cells.push(Cell::new(workspace_label.as_str()));
+                }
+                cells.extend(vec![
                     Cell::new(messages.as_str()).style(messages_cell_style),
                     Cell::new(size_kb.as_str()),
                     Cell::new(unique_users.as_str()),
@@ -1399,7 +1513,8 @@ fn cmd_list(
                     Cell::new(tool_uses.as_str()),
                     Cell::new(started.as_str()),
                     Cell::new(last_active.as_str()).style(last_active_cell_style),
-                ]));
+                ]);
+                table.add_row(Row::new(cells));
             }
 
             console.print_renderable(&table);
