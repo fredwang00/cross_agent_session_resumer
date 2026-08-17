@@ -423,12 +423,17 @@ fn pipeline_workspace_override_wins_over_recorded_workspace() {
         .convert("tgt", "sid-ov", opts)
         .expect("convert with workspace override should succeed");
 
+    // `absolutize_workspace` deliberately canonicalizes existing directories so
+    // the workspace matches the cwd a shell would report, so the writer receives
+    // the resolved path. On macOS that differs from the tempdir's own spelling
+    // (`/var` vs `/private/var`); on Linux the two coincide.
+    let expected_workspace = casr::pipeline::absolutize_workspace(override_dir.path());
     assert_eq!(
         dst.last_written()
             .expect("target should capture written session")
             .workspace
             .as_deref(),
-        Some(override_dir.path()),
+        Some(expected_workspace.as_path()),
         "writer must receive the overridden workspace"
     );
     assert!(
