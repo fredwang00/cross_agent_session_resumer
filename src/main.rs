@@ -1070,8 +1070,8 @@ fn cmd_list(
 
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
                 for candidate in &candidates {
-                    let expected_dir = projects_dir
-                        .join(casr::providers::claude_code::project_dir_key(candidate));
+                    let expected_dir =
+                        projects_dir.join(casr::providers::claude_code::project_dir_key(candidate));
                     let Ok(entries) = std::fs::read_dir(&expected_dir) else {
                         continue;
                     };
@@ -1437,8 +1437,11 @@ fn cmd_list(
             // Without the workspace, rows from different repos are
             // indistinguishable in an unscoped listing.
             if all_workspaces {
-                table = table
-                    .with_column(Column::new("Workspace").justify(JustifyMethod::Left).width(20));
+                table = table.with_column(
+                    Column::new("Workspace")
+                        .justify(JustifyMethod::Left)
+                        .width(20),
+                );
             }
             table = table
                 .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
