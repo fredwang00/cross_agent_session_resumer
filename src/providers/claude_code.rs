@@ -273,10 +273,11 @@ impl Provider for ClaudeCode {
                     }
                 }
                 Some("system") => {
-                    if entry.get("subtype").and_then(|v| v.as_str()) == Some("away_summary") {
-                        if let Some(c) = entry.get("content").and_then(|v| v.as_str()) {
-                            summary_title = Some(c.to_string());
-                        }
+                    if entry.get("subtype").and_then(|v| v.as_str()) == Some("away_summary")
+                        && let Some(c) = entry.get("content").and_then(|v| v.as_str())
+                        && let Some(cleaned) = clean_away_summary(c)
+                    {
+                        summary_title = Some(cleaned);
                     }
                 }
                 _ => {}
@@ -359,12 +360,15 @@ impl Provider for ClaudeCode {
 
         // Derive title: prefer the latest away_summary (stored in summary_title)
         // over the first user message, which is often a local-command caveat.
+        // A blank summary must not win, or the fallback is lost entirely.
         let first_user_title = messages
             .iter()
             .find(|m| m.role == MessageRole::User)
             .map(|m| truncate_title(&m.content, 100));
         let title = summary_title
-            .as_ref()
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(|s| truncate_title(s, 100))
             .or(first_user_title);
 
@@ -698,6 +702,25 @@ fn build_inner_message(
         });
     }
     inner_msg
+}
+
+/// UI hint Claude Code appends to some `away_summary` entries. It is chrome for
+/// the terminal recap, not part of the description, so it must not reach a title.
+const AWAY_SUMMARY_HINT: &str = "(disable recaps in /config)";
+
+/// Normalize an `away_summary` payload into a usable title, or `None` if it
+/// carries no description once the trailing UI hint is removed.
+fn clean_away_summary(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    let body = trimmed
+        .strip_suffix(AWAY_SUMMARY_HINT)
+        .unwrap_or(trimmed)
+        .trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
 }
 
 fn claude_session_id_hint(path: &Path) -> Option<String> {
@@ -1043,6 +1066,37 @@ not json at all
             crate::model::native_name_from_metadata(&session.metadata).as_deref(),
             Some("Threat modelling the auth service with STRIDE analysis")
         );
+    }
+
+    #[test]
+    fn reader_away_summary_strips_trailing_ui_hint() {
+        // 28% of real away_summary entries carry this recap chrome; it is not
+        // part of the description and must not leak into the title.
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"s23","message":{"role":"user","content":"go"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"Fixed the auth bug and added a regression test. (disable recaps in /config)","sessionId":"s23","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"s23","message":{"role":"assistant","content":"Done"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Fixed the auth bug and added a regression test.")
+        );
+        assert_eq!(
+            crate::model::native_name_from_metadata(&session.metadata).as_deref(),
+            Some("Fixed the auth bug and added a regression test.")
+        );
+    }
+
+    #[test]
+    fn reader_blank_away_summary_keeps_first_user_message_title() {
+        // A summary that is empty (or only the UI hint) must not shadow the
+        // fallback, or the session ends up with no title at all.
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"s24","message":{"role":"user","content":"Investigate the flaky test"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"   (disable recaps in /config)","sessionId":"s24","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"s24","message":{"role":"assistant","content":"Done"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        assert_eq!(session.title.as_deref(), Some("Investigate the flaky test"));
     }
 
     #[test]
