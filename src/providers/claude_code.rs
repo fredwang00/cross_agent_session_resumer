@@ -272,6 +272,13 @@ impl Provider for ClaudeCode {
                         summary_title = Some(t.to_string());
                     }
                 }
+                Some("system") => {
+                    if entry.get("subtype").and_then(|v| v.as_str()) == Some("away_summary") {
+                        if let Some(c) = entry.get("content").and_then(|v| v.as_str()) {
+                            summary_title = Some(c.to_string());
+                        }
+                    }
+                }
                 _ => {}
             }
 
@@ -350,11 +357,16 @@ impl Provider for ClaudeCode {
                 .to_string()
         });
 
-        // Derive title from first user message.
-        let title = messages
+        // Derive title: prefer the latest away_summary (stored in summary_title)
+        // over the first user message, which is often a local-command caveat.
+        let first_user_title = messages
             .iter()
             .find(|m| m.role == MessageRole::User)
             .map(|m| truncate_title(&m.content, 100));
+        let title = summary_title
+            .as_ref()
+            .map(|s| truncate_title(s, 100))
+            .or(first_user_title);
 
         // Most common model name.
         let model_name = model_counts
@@ -1011,6 +1023,54 @@ not json at all
         assert!(
             crate::model::native_name_from_metadata(&session.metadata).is_none(),
             "sessions without title metadata must have no native name"
+        );
+    }
+
+    #[test]
+    fn reader_away_summary_populates_native_name_and_title() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"s20","message":{"role":"user","content":"<local-command-caveat>Caveat: blah blah</local-command-caveat>"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"Threat modelling the auth service with STRIDE analysis","sessionId":"s20","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"s20","message":{"role":"assistant","content":"Done"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        // away_summary should win over first user message for title
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Threat modelling the auth service with STRIDE analysis")
+        );
+        // It should also populate native_name via the summary_title path
+        assert_eq!(
+            crate::model::native_name_from_metadata(&session.metadata).as_deref(),
+            Some("Threat modelling the auth service with STRIDE analysis")
+        );
+    }
+
+    #[test]
+    fn reader_away_summary_last_wins() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"s21","message":{"role":"user","content":"fix the bug"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"First summary: investigating the auth bug","sessionId":"s21","timestamp":"2026-01-01T00:30:00Z"}
+{"type":"system","subtype":"away_summary","content":"Fixed auth bug and added regression test","sessionId":"s21","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"s21","message":{"role":"assistant","content":"Done"},"uuid":"u2","timestamp":"2026-01-01T01:00:01Z"}"#,
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Fixed auth bug and added regression test")
+        );
+    }
+
+    #[test]
+    fn reader_custom_title_still_wins_over_away_summary() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"s22","message":{"role":"user","content":"do stuff"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"Summary from the harness","sessionId":"s22","timestamp":"2026-01-01T00:30:00Z"}
+{"type":"custom-title","customTitle":"My Renamed Session","sessionId":"s22"}
+{"type":"assistant","sessionId":"s22","message":{"role":"assistant","content":"Done"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        // custom-title should still win for native_name
+        assert_eq!(
+            crate::model::native_name_from_metadata(&session.metadata).as_deref(),
+            Some("My Renamed Session")
         );
     }
 
